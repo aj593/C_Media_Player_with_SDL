@@ -1,15 +1,24 @@
-// gcc -o tutorial01 tutorial01.c -lavutil -lavformat -lavcodec -lswscale -lz -lm
+// gcc -o main main.c -lavutil -lavformat -lavcodec -lswscale -lz -lm  `sdl2-config --cflags --libs`
 
+//#include <unistd.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_thread.h>
 
 void save_frame(AVFrame* av_frame, int width, int height, int frame_index);
 
 int main(int argc, char* argv[]){
   if(argc != 3){
+    printf("Need exactly 3 args, you provided %d args", argc);
     return -1; //exit with error b/c of wrong number of args
+  }
+
+  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) != 0){
+    printf("Could not initialize SDL - %s\n", SDL_GetError());
+    return -1;
   }
 
   AVFormatContext* p_format_context = NULL;
@@ -70,18 +79,44 @@ int main(int argc, char* argv[]){
     return -1;
   }
 
-  //Will convert frame from native format to RGB later
-  //Convert initial frame to a specific format, first allocate AVFrame struct
-  AVFrame* p_frame_RGB = NULL;
-  if((p_frame_RGB = av_frame_alloc()) == NULL){
-    printf("Could not allocate frame\n");
+  SDL_Window* screen = SDL_CreateWindow(
+    "SDL Video Player",
+    SDL_WINDOWPOS_UNDEFINED,
+    SDL_WINDOWPOS_UNDEFINED,
+    p_codec_context->width/2,
+    p_codec_context->height/2,
+    SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI
+  );
+
+  if(!screen){
+    printf("SDL: could not set video mode - exiting");
     return -1;
   }
+
+  SDL_GL_SetSwapInterval(1);
+  SDL_Renderer* renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
+  SDL_Texture* texture = SDL_CreateTexture(  // [4]
+    renderer,
+    SDL_PIXELFORMAT_YV12,
+    SDL_TEXTUREACCESS_STREAMING,
+    p_codec_context->width,
+    p_codec_context->height
+  );
 
   int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, p_codec_context->width, p_codec_context->height, 32);
   uint8_t* buffer = NULL; //array buffer that will hold raw data when converting frame
   if((buffer = (uint8_t*)av_malloc(num_bytes * sizeof(uint8_t))) == NULL){
     printf("Could not allocate buffer for raw data");
+    return -1;
+  }
+
+  SDL_Event event;
+
+  //Will convert frame from native format to RGB later
+  //Convert initial frame to a specific format, first allocate AVFrame struct
+  AVFrame* p_frame_RGB = NULL;
+  if((p_frame_RGB = av_frame_alloc()) == NULL){
+    printf("Could not allocate frame\n");
     return -1;
   }
 
@@ -97,18 +132,18 @@ int main(int argc, char* argv[]){
   );
 
   //Read through entire video stream by reading in the packet, decoding it into our frame, and convert and save it once it's complete
-  struct SwsContext* sws_context = NULL;
-  sws_context = sws_getContext(   // [13]
-        p_codec_context->width,
-        p_codec_context->height,
-        p_codec_context->pix_fmt,
-        p_codec_context->width,
-        p_codec_context->height,
-        AV_PIX_FMT_RGB24,   // sws_scale destination color scheme
-        SWS_BILINEAR,
-        NULL,
-        NULL,
-        NULL
+  struct SwsContext* sws_context = 
+    sws_getContext( 
+      p_codec_context->width,
+      p_codec_context->height,
+      p_codec_context->pix_fmt,
+      p_codec_context->width,
+      p_codec_context->height,
+      AV_PIX_FMT_RGB24,   // sws_scale destination color scheme
+      SWS_BILINEAR,
+      NULL,
+      NULL,
+      NULL
     );
 
   AVPacket* p_packet = NULL;
@@ -145,16 +180,49 @@ int main(int argc, char* argv[]){
           p_frame_RGB->linesize
         );
         if(++i <= max_frames_to_decode){
-          save_frame(p_frame_RGB, p_codec_context->width, p_codec_context->height, i);
+          //save_frame(p_frame_RGB, p_codec_context->width, p_codec_context->height, i);
+
+          //getting clip time and fps
+          double fps = av_q2d(p_format_context->streams[video_stream]->r_frame_rate);
+          double sleep_time = 1.0/fps; //@TODO: cast fps to double?
+          SDL_Delay((1000 * sleep_time) - 10); //give time for CPU scheduling
+          
+          //SDL_Rect struct holding the window's position and height
+          SDL_Rect rect = {0, 0, p_codec_context->width, p_codec_context->height}; //@TODO: right way to initialize this struct?
+
+          //Update a rectangle within a planar
+          SDL_UpdateYUVTexture(
+            texture,            // the texture to update
+            &rect,              // a pointer to the rectangle of pixels to update, or NULL to update the entire texture
+            p_frame_RGB->data[0],      // the raw pixel data for the Y plane
+            p_frame_RGB->linesize[0],  // the number of bytes between rows of pixel data for the Y plane
+            p_frame_RGB->data[1],      // the raw pixel data for the U plane
+            p_frame_RGB->linesize[1],  // the number of bytes between rows of pixel data for the U plane
+            p_frame_RGB->data[2],      // the raw pixel data for the V plane
+            p_frame_RGB->linesize[2]   // the number of bytes between rows of pixel data for the V plane
+          );
+
+          SDL_RenderClear(renderer); //Clear current rendering target with drawing color
+          SDL_RenderCopy(renderer, texture, NULL, NULL); //Copy portion of the texture to the current rendering target
+          SDL_RenderPresent(renderer); //Update the screen with any rendering performed since previous call
         }
         else break;
       }
       if(i > max_frames_to_decode) break;
     }
     av_packet_unref(p_packet); //Free packet allocated by av_read_frame
+
+    SDL_PollEvent(&event); //Handling the ctrl + C event to exit
+      switch(event.type){
+        case SDL_QUIT:{
+          SDL_Quit();
+          exit(0);
+        } break;
+        default: {} break;
+      }
   }
 
-  //Clean up operations
+  //Clean up operaxtions
   av_free(buffer);
   av_frame_free(&p_frame_RGB);
   av_free(p_frame_RGB);
@@ -164,10 +232,13 @@ int main(int argc, char* argv[]){
   avcodec_close(p_codec_context_original);
   avformat_close_input(&p_format_context);
 
+  SDL_DestroyRenderer(renderer);
+  SDL_Quit();
+
   return 0;
 }
 
-void save_frame(AVFrame* av_frame, int width, int height, int frame_index){
+/**void save_frame(AVFrame* av_frame, int width, int height, int frame_index){
   FILE* p_file;
   char filename_size[32];
   sprintf(filename_size, "frame%d.ppm", frame_index);
@@ -181,4 +252,4 @@ void save_frame(AVFrame* av_frame, int width, int height, int frame_index){
   }
 
   fclose(p_file);
-}
+}*/
